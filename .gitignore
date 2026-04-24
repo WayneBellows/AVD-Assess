@@ -1,0 +1,39 @@
+# Generated reports
+AVD-Assess-Report-*.html
+_dryrun*.html
+*.html
+!docs/*.html
+
+# PowerShell / PowerShell module artefacts
+*.ps1xml.bak
+PSScriptAnalyzerSettings.local.psd1
+profile.ps1
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Windows
+Thumbs.db
+ehthumbs.db
+ehthumbs_vista.db
+Desktop.ini
+$RECYCLE.BIN/
+*.lnk
+
+# macOS (for cross-platform contributors)
+.DS_Store
+.AppleDouble
+.LSOverride
+
+# Logs / temp
+*.log
+*.tmp
+*.temp
+
+# Local override files
+settings.local.*
+*.local.json
