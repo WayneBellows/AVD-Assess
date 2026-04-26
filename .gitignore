@@ -38,3 +38,6 @@ $RECYCLE.BIN/
 # Local override files
 settings.local.*
 *.local.json
+
+# Spec
+AVD-Assess-Build-Spec.md
