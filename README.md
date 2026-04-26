@@ -42,6 +42,28 @@ cd AVD-Assess
 
 The script signs you in (unless `-UseExistingConnection` is used), collects AVD data, runs the 16 checks, and writes `AVD-Assess-Report-<timestamp>.html` to the current directory.
 
+## Running from Azure Cloud Shell
+
+AVD-Assess works in [Azure Cloud Shell](https://shell.azure.com) (PowerShell mode) — no local install, and you're already signed in to your tenant.
+
+```powershell
+# 1. Install the one module Cloud Shell doesn't ship by default
+Install-Module Az.DesktopVirtualization -Scope CurrentUser -Force
+
+# 2. Download the script into your persistent Cloud Drive
+curl -o ~/clouddrive/AVD-Assess.ps1 https://raw.githubusercontent.com/waynebellows/AVD-Assess/main/AVD-Assess.ps1
+
+# 3. Run it against your current Cloud Shell context
+~/clouddrive/AVD-Assess.ps1 -UseExistingConnection -OutputPath ~/clouddrive/avd-assess.html
+```
+
+Then use **Manage files &rarr; Download** in the Cloud Shell toolbar to grab `avd-assess.html` and open it locally.
+
+**Notes:**
+- Use `-UseExistingConnection` — Cloud Shell is already authenticated.
+- Omit `-OpenReport` — there's no browser inside Cloud Shell.
+- Writing to `~/clouddrive` keeps the report across sessions.
+
 ## Parameters
 
 | Parameter | Description | Example |
