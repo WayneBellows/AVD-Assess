@@ -50,7 +50,7 @@
     .\AVD-Assess.ps1 -UseExistingConnection -OutputPath "C:\Reports\avd-health.html"
 
 .NOTES
-    Author   : Wayne Bellows (wbellows@getnerdio.com)
+    Author   : Wayne Bellows (wayne_bellows@hotmail.com)
     Website  : https://modern-euc.com
     Project  : https://github.com/waynebellows/AVD-Assess
     License  : MIT

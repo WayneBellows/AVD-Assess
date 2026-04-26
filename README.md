@@ -110,4 +110,4 @@ Bug reports, new checks, and report design improvements are all welcome. See [CO
 
 ---
 
-Built by [Wayne Bellows](https://modern-euc.com) · Feedback: wbellows@getnerdio.com
+Built by [Wayne Bellows](https://modern-euc.com) · Feedback: wayne_bellows@hotmail.com
