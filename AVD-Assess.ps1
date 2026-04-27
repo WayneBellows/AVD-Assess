@@ -157,6 +157,45 @@ function Get-RdpProperty {
     return $null
 }
 
+function Get-RgFromArmId {
+    # Extracts the resource group name from an ARM resource ID. ARM IDs have the
+    # shape: /subscriptions/<sub>/resourceGroups/<rg>/providers/<...>
+    param([Parameter(Mandatory)][string]$ResourceId)
+    $parts = $ResourceId -split '/'
+    if ($parts.Count -ge 5) { return $parts[4] }
+    throw "Cannot extract resource group from ARM ID: $ResourceId"
+}
+
+function Invoke-WithRetry {
+    # Wraps a scriptblock in a small retry loop with exponential backoff. Retries
+    # on transient ARM throttling (HTTP 429) and gateway timeouts; surfaces other
+    # errors immediately so genuine failures still throw quickly.
+    [CmdletBinding()]
+    param(
+        [Parameter(Mandatory)][scriptblock]$ScriptBlock,
+        [int]$MaxAttempts = 3,
+        [int]$InitialDelaySeconds = 2,
+        [string]$OperationName = 'Azure operation'
+    )
+    $attempt = 0
+    $delay   = $InitialDelaySeconds
+    while ($true) {
+        $attempt++
+        try {
+            return & $ScriptBlock
+        } catch {
+            $msg = $_.Exception.Message
+            $isTransient = $msg -match '\b(429|TooManyRequests|throttl|timeout|GatewayTimeout|ServiceUnavailable|503)\b'
+            if (-not $isTransient -or $attempt -ge $MaxAttempts) {
+                throw
+            }
+            Write-Verbose "$OperationName attempt $attempt failed (transient): $msg. Retrying in $delay s."
+            Start-Sleep -Seconds $delay
+            $delay = [math]::Min($delay * 2, 30)
+        }
+    }
+}
+
 function Get-ScoreColour {
     param([int]$Score)
     if ($Score -ge 80) { return '#B3FF00' }  # lime green
@@ -401,13 +440,19 @@ function Get-AvdEnvironmentData {
     try {
         if ($HostPoolName -and $ResourceGroupName) {
             Write-Host '  Fetching host pool...            ' -NoNewline
-            $script:allHostPools = @(Get-AzWvdHostPool -ResourceGroupName $ResourceGroupName -Name $HostPoolName)
+            $script:allHostPools = @(Invoke-WithRetry -OperationName 'Get-AzWvdHostPool' -ScriptBlock {
+                Get-AzWvdHostPool -ResourceGroupName $ResourceGroupName -Name $HostPoolName
+            })
         } elseif ($ResourceGroupName) {
             Write-Host '  Fetching host pools...           ' -NoNewline
-            $script:allHostPools = @(Get-AzWvdHostPool -ResourceGroupName $ResourceGroupName)
+            $script:allHostPools = @(Invoke-WithRetry -OperationName 'Get-AzWvdHostPool' -ScriptBlock {
+                Get-AzWvdHostPool -ResourceGroupName $ResourceGroupName
+            })
         } else {
             Write-Host '  Fetching host pools...           ' -NoNewline
-            $script:allHostPools = @(Get-AzWvdHostPool)
+            $script:allHostPools = @(Invoke-WithRetry -OperationName 'Get-AzWvdHostPool' -ScriptBlock {
+                Get-AzWvdHostPool
+            })
         }
         Write-Host ("Found {0} host pool(s)" -f $script:allHostPools.Count) -ForegroundColor Green
     } catch {
@@ -426,10 +471,12 @@ function Get-AvdEnvironmentData {
     Write-Host '  Fetching session hosts...        ' -NoNewline
     $shList = [System.Collections.Generic.List[object]]::new()
     foreach ($hp in $script:allHostPools) {
-        $hpRg   = ($hp.Id -split '/')[4]
+        $hpRg   = Get-RgFromArmId -ResourceId $hp.Id
         $hpName = $hp.Name
         try {
-            $hosts = @(Get-AzWvdSessionHost -ResourceGroupName $hpRg -HostPoolName $hpName -ErrorAction Stop)
+            $hosts = @(Invoke-WithRetry -OperationName "Get-AzWvdSessionHost ($hpName)" -ScriptBlock {
+                Get-AzWvdSessionHost -ResourceGroupName $hpRg -HostPoolName $hpName -ErrorAction Stop
+            })
             foreach ($h in $hosts) {
                 $h | Add-Member -NotePropertyName '_HostPoolName'       -NotePropertyValue $hpName      -Force
                 $h | Add-Member -NotePropertyName '_HostPoolResourceId' -NotePropertyValue $hp.Id       -Force
@@ -448,9 +495,13 @@ function Get-AvdEnvironmentData {
     Write-Host '  Fetching scaling plans...        ' -NoNewline
     try {
         if ($ResourceGroupName) {
-            $script:allScalingPlans = @(Get-AzWvdScalingPlan -ResourceGroupName $ResourceGroupName -ErrorAction Stop)
+            $script:allScalingPlans = @(Invoke-WithRetry -OperationName 'Get-AzWvdScalingPlan' -ScriptBlock {
+                Get-AzWvdScalingPlan -ResourceGroupName $ResourceGroupName -ErrorAction Stop
+            })
         } else {
-            $script:allScalingPlans = @(Get-AzWvdScalingPlan -ErrorAction Stop)
+            $script:allScalingPlans = @(Invoke-WithRetry -OperationName 'Get-AzWvdScalingPlan' -ScriptBlock {
+                Get-AzWvdScalingPlan -ErrorAction Stop
+            })
         }
         Write-Host ("Found {0} scaling plan(s)" -f $script:allScalingPlans.Count) -ForegroundColor Green
     } catch {
@@ -467,10 +518,12 @@ function Get-AvdEnvironmentData {
         foreach ($vmId in $uniqueVmIds) {
             $parts = $vmId -split '/'
             if ($parts.Count -lt 9) { continue }
-            $vmRg   = $parts[4]
+            $vmRg   = Get-RgFromArmId -ResourceId $vmId
             $vmName = $parts[-1]
             try {
-                $vm = Get-AzVM -ResourceGroupName $vmRg -Name $vmName -Status -ErrorAction Stop
+                $vm = Invoke-WithRetry -OperationName "Get-AzVM ($vmName)" -ScriptBlock {
+                    Get-AzVM -ResourceGroupName $vmRg -Name $vmName -Status -ErrorAction Stop
+                }
                 if ($vm) { $vmList.Add($vm) }
             } catch {
                 Write-Verbose "VM fetch failed for $vmId : $($_.Exception.Message)"
@@ -493,7 +546,9 @@ function Get-AvdEnvironmentData {
     $diagOk = 0
     foreach ($hp in $script:allHostPools) {
         try {
-            $ds = @(Get-AzDiagnosticSetting -ResourceId $hp.Id -ErrorAction Stop)
+            $ds = @(Invoke-WithRetry -OperationName "Get-AzDiagnosticSetting ($($hp.Name))" -ScriptBlock {
+                Get-AzDiagnosticSetting -ResourceId $hp.Id -ErrorAction Stop
+            })
             $script:diagnosticSettings[$hp.Id] = $ds
             $diagOk++
         } catch {
@@ -507,17 +562,26 @@ function Get-AvdEnvironmentData {
         Write-Host 'Done' -ForegroundColor Green
     }
 
-    # Tags (via Get-AzResource so we read the authoritative ARM tag collection)
+    # Tags. Prefer the inline $hp.Tag property when present (saves one ARM call
+    # per host pool) and fall back to Get-AzResource only when it's null/missing,
+    # since Az.DesktopVirtualization output has historically been inconsistent on
+    # whether tags are populated inline.
     Write-Host '  Fetching resource tags...        ' -NoNewline
     $tagOk = 0
     foreach ($hp in $script:allHostPools) {
-        try {
-            $res = Get-AzResource -ResourceId $hp.Id -ErrorAction Stop
-            $script:hostPoolTags[$hp.Id] = $res.Tags
-            $tagOk++
-        } catch {
-            $script:hostPoolTags[$hp.Id] = $null
+        $tags = $hp.Tag
+        if (-not $tags -or $tags.Count -eq 0) {
+            try {
+                $res = Invoke-WithRetry -OperationName "Get-AzResource ($($hp.Name))" -ScriptBlock {
+                    Get-AzResource -ResourceId $hp.Id -ErrorAction Stop
+                }
+                $tags = $res.Tags
+            } catch {
+                $tags = $null
+            }
         }
+        $script:hostPoolTags[$hp.Id] = $tags
+        if ($null -ne $tags) { $tagOk++ }
     }
     if ($tagOk -eq 0 -and $script:allHostPools.Count -gt 0) {
         $script:TagFetchFailed = $true
