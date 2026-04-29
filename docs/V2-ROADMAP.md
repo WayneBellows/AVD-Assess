@@ -71,17 +71,20 @@ The 5th WAF pillar. New donut on the report; check rows live alongside Cost / Re
 
 ### PE4 — FSLogix storage region colocation
 
-**Detection.** Hard problem — there's no ARM API to ask *"which storage account does this host pool's FSLogix use?"*. Two-stage discovery:
+**Detection.** Hard problem — there's no ARM API to ask *"which storage account does this host pool's FSLogix use?"* (FSLogix is configured per-VM via a registry value pointing at a UNC path; not surfaced through ARM). Three-stage discovery, each step configurable, with the discovery method recorded in the finding text so admins know whether to trust the result:
 
-1. Look for a tag convention on the host pool (default: `FSLogixStorageAccount`, configurable via new `-FSLogixTagName` parameter).
-2. Fall back to a name-pattern scan of storage accounts in the host pool's resource group (default pattern: `*fslogix*`, configurable via `-FSLogixNamePattern`).
+1. **Explicit override** — if `-FSLogixStorageAccount <name>` is passed at runtime, use that for every host pool. Foolproof; for one-off runs.
+2. **Tag convention** — read the host pool tag named `FSLogixStorageAccount` (configurable via `-FSLogixTagName`). AVD-Assess effectively proposes this as a community convention; no Microsoft-blessed standard exists.
+3. **Name-pattern scan** — match storage accounts in the host pool's resource group against `*fslogix*` case-insensitive (configurable via `-FSLogixNamePattern`).
+
+If all three fail, the check returns `Info` with a remediation that suggests adding the tag or passing the parameter.
 
 For each discovered (host pool, storage account) pair, compare `$storageAccount.Location` to host pool `.Location`.
 
 **Scoring.**
 - Pass — all FSLogix storage colocated with their host pool
 - Warning — any cross-region pairing (named with the latency penalty estimate)
-- Info — couldn't identify FSLogix storage for any host pool (suggest tag convention)
+- Info — couldn't auto-discover FSLogix storage for any host pool
 
 **Why it matters.** Cross-region FSLogix profile traffic adds 40–80 ms to every `OpenFile` against the profile container, which means *every application launch* and *every Outlook search* in the user's session. Single biggest "why is sign-in slow" cause and currently invisible to v1.
 
@@ -169,6 +172,7 @@ When `JSON` or `Both`, write `<basename>.json` alongside the HTML report. Schema
 {
   "tool": "AVD-Assess",
   "version": "2.0.0",
+  "schemaVersion": "1.0",
   "generatedAt": "2026-04-27T14:23:00Z",
   "environment": {
     "subscriptionId": "...",
@@ -207,6 +211,11 @@ When `JSON` or `Both`, write `<basename>.json` alongside the HTML report. Schema
 
 **Foundation for everything that follows** — compare mode, dashboards, CI/CD gates.
 
+**Schema versioning.** The top-level `schemaVersion` field follows semver:
+- **Major** bump when fields are removed or renamed (breaking change for consumers)
+- **Minor** bump when fields are added (additive, backward-compatible)
+- The `-CompareTo` mode reads this field and refuses to diff incompatible major versions with a clear error message rather than silently producing wrong deltas.
+
 ---
 
 ### T2 — Compare to previous
@@ -231,11 +240,14 @@ Crucial for the question every sponsor actually asks: *"is this getting better o
 When set:
 
 - Iterate `Get-AzSubscription` for all subscriptions accessible to the current context
-- Produce one HTML/JSON pair per subscription, named `AVD-Assess-Report-<subscription-shortname>-<timestamp>.html`
-- Produce a roll-up `index.html` listing all subscriptions with their overall scores and direct links into each detailed report
-- Subscriptions with no AVD resources are skipped silently
+- **Pre-flight permission probe** — for each candidate subscription, attempt a cheap probe (e.g. `Get-AzResourceGroup -DefaultProfile <ctx>` with `-First 1`) before the real assessment runs. Subscriptions that throw on probe are logged to the console as `skipped: insufficient permissions` and excluded from the assessment loop.
+- Produce one HTML/JSON pair per assessed subscription, named `AVD-Assess-Report-<subscription-shortname>-<timestamp>.html`
+- Produce a roll-up `index.html` listing every subscription with three sections:
+  - **Assessed** — overall score and direct link into the detailed report
+  - **Empty** — subscriptions with no AVD resources (skipped silently mid-run, surfaced here so the user knows they were checked)
+  - **Skipped** — subscriptions where the pre-flight probe failed (with the underlying error class)
 
-Most enterprise AVD estates span 2–5 subs (separate prod/dev/dr) — single-sub mode is the wrong default for that audience.
+Most enterprise AVD estates span 2–5 subs (separate prod/dev/dr) — single-sub mode is the wrong default for that audience. Pre-flight skip prevents one inaccessible sub from aborting an otherwise successful sweep across the rest.
 
 ---
 
@@ -262,7 +274,23 @@ Each fetch wrapped in `Invoke-WithRetry` (already in v1.1) and degrades affected
 
 ### Refactor 3 — HTML grid for 5 categories
 
-Current 2×2 layout becomes either 5 cards in a 3+2 flow (CSS grid `repeat(auto-fit, minmax(...))` already handles this — just need to verify visual balance) or a top-row Performance card spanning full width with the existing 2×2 below.
+Explicit **3+2 grid** with this fixed ordering:
+
+```
+┌──────────┬──────────────┬──────────┐
+│   Cost   │ Reliability  │ Security │
+├──────────┴──────┬───────┴──────────┤
+│   Operations    │   Performance    │
+└─────────────────┴──────────────────┘
+```
+
+Rationale:
+- Keeps Cost in the top-left (its position in v1) — minimal disruption to existing visual identity
+- Predictable at every viewport ≥ 960px (no orphan-card scenario from auto-fit at awkward widths)
+- Performance lands in the bottom-right — the new pillar's "newest" position naturally draws the eye on a return visit
+- Below 760px the grid stacks 1-up the same way v1 does
+
+Implementation: `grid-template-columns: repeat(3, 1fr)` for the top row, `grid-template-columns: repeat(2, 1fr)` for the bottom — or a single 6-column grid with `grid-column: span 2` on the bottom-row cards. Pick whichever produces equal visual weight when previewed.
 
 ---
 
@@ -311,11 +339,11 @@ Each step is its own PR, mergeable independently, with parse-check + dry-run ver
 
 ---
 
-## Open questions
+## Resolved decisions
 
-1. **FSLogix discovery default tag name.** `FSLogixStorageAccount` proposed — is there an industry convention, or should we stay configurable with no default?
-2. **5-card HTML layout.** 3+2 flow vs. full-width Performance card on top vs. let CSS auto-fit decide?
-3. **JSON schema versioning.** Add `schemaVersion: "1.0"` to the JSON envelope so future breaking changes can be detected by consumers.
-4. **`-AllAccessibleSubscriptions` permission story.** Reader on each sub is required — should we pre-flight check and skip subs where the current identity has no rights, or fail loudly?
+The following design questions were raised during roadmap drafting and have been resolved:
 
-These should be resolved (issue or PR discussion) before the first v2.0 PR lands.
+1. **FSLogix discovery.** No industry-standard tag exists. Ship with three-stage discovery (explicit parameter → tag → name pattern) and propose `FSLogixStorageAccount` as the default tag name. All three stages configurable. See PE4 / R6 above.
+2. **5-card HTML layout.** Fixed 3+2 grid with Cost / Reliability / Security on top and Operations / Performance on the bottom. Keeps v1's top-left identity (Cost) intact and gives the new Performance pillar a stable home in the bottom-right. See Refactor 3 above.
+3. **JSON schema versioning.** `schemaVersion: "1.0"` in the JSON envelope. Major bump = breaking; minor bump = additive. `-CompareTo` refuses to diff incompatible major versions. See T1 above.
+4. **Multi-subscription permission story.** Pre-flight permission probe per subscription; failures get logged and excluded from the sweep but the run continues. Roll-up `index.html` reports skipped subs in their own section. See T3 above.
