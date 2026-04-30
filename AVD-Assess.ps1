@@ -83,6 +83,134 @@ $script:RequiredModules = @(
 )
 
 # ==============================================================================
+# CHECK CATALOG
+# ==============================================================================
+#
+# Single source of truth for each check's display name, canonical remediation
+# text, and Microsoft Learn URL. Read by both the real check functions and the
+# dry-run seeder so the two stay in sync.
+#
+# Special-case remediations (e.g. "Grant Reader role…" when a permission fetch
+# fails) are kept inline at the call site rather than catalogued, because they
+# describe *why* a fetch failed and aren't part of the check's primary advice.
+
+$script:CheckCatalog = @{
+
+    # ---- Cost Optimisation ----
+    ScalingPlanCoverage = [PSCustomObject]@{
+        Name        = 'Scaling Plan Coverage'
+        Remediation = 'Create and assign a scaling plan to each pooled host pool. Scaling plans can reduce Azure compute costs by 40-70% for environments with predictable daily usage patterns by automatically deallocating idle session hosts outside peak hours.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+    }
+
+    StartVmOnConnect = [PSCustomObject]@{
+        Name        = 'Start VM on Connect (Personal Host Pools)'
+        Remediation = 'Enable Start VM on Connect on all personal host pools. This ensures personal VMs are only running when users need them, rather than 24/7. Combine with an auto-shutdown schedule for maximum savings. A personal VM running 24/7 costs approximately 3x more than one using Start VM on Connect with an 8-hour working day pattern.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/start-virtual-machine-connect'
+    }
+
+    UnhealthyHostsInRotation = [PSCustomObject]@{
+        Name        = 'Unhealthy Hosts in Session Rotation'
+        Remediation = 'Set AllowNewSession = false on unhealthy hosts to drain them from the load balancer. This prevents new users from connecting to broken session hosts. Investigate the underlying health issue (check AVD agent logs at C:\Program Files\Microsoft RDAgent\) and either remediate the VM or replace the session host.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/drain-mode'
+    }
+
+    MaxSessionLimit = [PSCustomObject]@{
+        Name        = 'Max Session Limit Configuration'
+        Remediation = 'Set a realistic max session limit based on your VM size and workload type. Recommended starting points: D4s_v5 (4 vCPU / 16 GB) - 8-12 sessions for knowledge workers, 12-16 for task workers. D8s_v5 (8 vCPU / 32 GB) - 16-24 sessions for knowledge workers. Setting an appropriate limit enables the load balancer to start new session hosts before existing ones become overloaded.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-host-pool-load-balancing'
+    }
+
+    # ---- Reliability & Resilience ----
+    SessionHostHealth = [PSCustomObject]@{
+        Name        = 'Session Host Health'
+        Remediation = 'Investigate unhealthy session hosts using AVD Insights in the Azure portal (if diagnostic settings are configured) or by reviewing the AVD agent log directly on the affected VM at C:\Program Files\Microsoft RDAgent\. Common causes: domain trust relationship lost, FSLogix health failures, AVD agent crash, or underlying VM disk/network issues. Consider enabling AVD health alerts via Azure Monitor.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-session-host-in-use'
+    }
+
+    RdpShortpath = [PSCustomObject]@{
+        Name        = 'RDP Shortpath / Network Auto-Detect'
+        Remediation = 'Add networkautodetect:i:1 and bandwidthautodetect:i:1 to the Custom RDP Properties of each host pool. These settings enable RDP Shortpath (UDP), which provides significantly lower latency, better audio/video quality, and improved session resilience compared to the TCP Reverse Connect fallback. Also ensure UDP port 3478 (STUN) is permitted outbound at the firewall for public network Shortpath.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-shortpath'
+    }
+
+    AgentUpdateRing = [PSCustomObject]@{
+        Name                       = 'Agent Update Ring'
+        # Default to the more common case (no validation pools); the real check
+        # function picks RemediationAllValidation when every pool is on validation.
+        Remediation                = 'Mark at least one non-production or low-risk host pool as a Validation environment in its properties. Validation ring pools receive AVD agent updates 1-2 weeks before the production ring, giving you an early warning of any issues before they affect all users.'
+        RemediationAllValidation   = 'Move your production host pools off the Validation ring. Only canary, dev, or test host pools should be in Validation. Production users should be on the standard update ring for maximum stability.'
+        LearnMore                  = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-validation-environment'
+    }
+
+    SessionCapacityHeadroom = [PSCustomObject]@{
+        Name        = 'Session Capacity Headroom'
+        Remediation = 'Add session hosts to the over-capacity pool(s), or review whether the max session limit is set too high relative to available VM resources. Also review the scaling plan ramp-up schedule to ensure hosts are started before peak demand rather than in response to it - proactive scaling prevents the headroom problem entirely.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+    }
+
+    # ---- Security Posture ----
+    DriveRedirection = [PSCustomObject]@{
+        Name        = 'Drive Redirection Policy'
+        Remediation = 'Review the drivestoredirect RDP property on each flagged host pool. Set drivestoredirect:s: (empty value) to disable drive redirection entirely, or drivestoredirect:s:DynamicDrives to allow only removable drives (USB). In regulated environments (financial services, healthcare, government), drive redirection should be explicitly disabled unless a business case exists and it is documented.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties'
+    }
+
+    ClipboardRedirection = [PSCustomObject]@{
+        Name        = 'Clipboard Redirection Policy'
+        Remediation = 'If clipboard access is not required for user productivity or is prohibited by your data security policy, set redirectclipboard:i:0 in host pool RDP properties. This is particularly important for environments handling sensitive personal or financial data where copy/paste to local devices would represent a compliance risk.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties'
+    }
+
+    TrustedLaunch = [PSCustomObject]@{
+        Name        = 'Trusted Launch / Secure Boot'
+        Remediation = 'New session host deployments should use Trusted Launch (enabled by default for Gen2 VMs in Azure). For existing VMs, Microsoft now supports migration to Trusted Launch for Gen2 VMs without redeployment. See the Learn More link for the migration process. Trusted Launch enables Secure Boot (prevents unsigned bootloaders and drivers) and vTPM (supports attestation and BitLocker).'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-existing-vm'
+    }
+
+    EntraIdJoin = [PSCustomObject]@{
+        Name        = 'Entra ID Join Status'
+        Remediation = 'Evaluate migrating new host pool deployments to Entra ID join. This eliminates line-of-sight dependency on domain controllers, simplifies the identity architecture, and enables Conditional Access at the session level. Note: FSLogix profiles, MSIX App Attach, and some legacy applications may require additional planning for Entra ID join scenarios.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/deploy-azure-ad-joined-vm'
+    }
+
+    # ---- Operational Excellence ----
+    DiagnosticSettings = [PSCustomObject]@{
+        Name        = 'Diagnostic Settings'
+        Remediation = 'Configure diagnostic settings on each flagged host pool to send the following log categories to a Log Analytics workspace: Connection, HostRegistration, Error, Management, AgentHealthStatus. This is a prerequisite for AVD Insights and enables troubleshooting of connection failures, performance issues, and agent problems. Without diagnostic logs, you are flying blind.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/diagnostics-log-analytics'
+    }
+
+    ResourceTagging = [PSCustomObject]@{
+        Name        = 'Resource Tagging'
+        Remediation = 'Apply the following tags to all AVD resources (host pools, session hosts, workspaces, storage accounts): Environment (e.g. Production, Development, Test) and Owner (team or person responsible). Consider using Azure Policy with a DeployIfNotExists or Deny effect to enforce tagging at resource creation. Good tagging enables cost analysis by environment in Azure Cost Management.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/tag-resources'
+    }
+
+    AgentUpdateState = [PSCustomObject]@{
+        Name        = 'AVD Agent Update State'
+        Remediation = 'Investigate agent update failures on the affected session hosts. Start by reviewing the RDAgent log at C:\Program Files\Microsoft RDAgent\AgentInstall.txt. Common causes: Windows Update failing to install prerequisites, a network proxy blocking the agent download endpoint (*.wvd.microsoft.com), antivirus blocking the installer, or the VM needing a restart. After resolving, restart the RDAgentBootLoader service to retry the update.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-agent'
+    }
+
+    LoadBalancingAlgorithm = [PSCustomObject]@{
+        Name        = 'Load Balancing Algorithm'
+        Remediation = 'BreadthFirst is recommended when user experience is the top priority - each user gets more dedicated resources. DepthFirst is recommended when cost is the priority and the workload is not resource-intensive - it allows more VMs to be fully shut down during off-peak hours. Review your choice against your scaling plan configuration: DepthFirst works best with aggressive scale-in, BreadthFirst pairs well with reserved instances on a core set of always-on hosts.'
+        LearnMore   = 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-host-pool-load-balancing'
+    }
+}
+
+function Get-Check {
+    # Returns the catalog entry for a check ID. Throws on unknown IDs so typos
+    # surface immediately rather than producing reports with blank fields.
+    param([Parameter(Mandatory)][string]$Id)
+    if (-not $script:CheckCatalog.ContainsKey($Id)) {
+        throw "Unknown check ID '$Id'. Catalog keys: $(($script:CheckCatalog.Keys | Sort-Object) -join ', ')"
+    }
+    return $script:CheckCatalog[$Id]
+}
+
+# ==============================================================================
 # HELPER FUNCTIONS
 # ==============================================================================
 
@@ -294,89 +422,93 @@ function Initialize-DryRunData {
     $script:ScalingPlanCount = 3
     $script:VmCount          = 47
 
+    # Each entry below seeds one synthetic check result. Name / Remediation /
+    # LearnMore come from $script:CheckCatalog so the dry-run report stays in
+    # lock-step with the canonical text used by the real check functions.
+
     Write-Section 'Cost Optimisation'
-    Add-CheckResult -Category Cost -CheckName 'Scaling Plan Coverage' -Status Fail -Score 40 `
+    $m = Get-Check 'ScalingPlanCoverage'
+    Add-CheckResult -Category Cost -CheckName $m.Name -Status Fail -Score 40 `
         -Finding '2 of 5 pooled host pool(s) have a scaling plan assigned. Uncovered: hp-prod-pooled-02, hp-prod-pooled-04, hp-dev-pooled-01.' `
-        -Remediation 'Create and assign a scaling plan to each pooled host pool. Scaling plans can reduce Azure compute costs by 40-70% for environments with predictable daily usage patterns by automatically deallocating idle session hosts outside peak hours.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Cost -CheckName 'Start VM on Connect (Personal Host Pools)' -Status Warning -Score 40 `
+    $m = Get-Check 'StartVmOnConnect'
+    Add-CheckResult -Category Cost -CheckName $m.Name -Status Warning -Score 40 `
         -Finding '1 of 2 personal host pool(s) have Start VM on Connect disabled: hp-personal-exec.' `
-        -Remediation 'Enable Start VM on Connect on all personal host pools. This ensures personal VMs are only running when users need them, rather than 24/7. A personal VM running 24/7 costs approximately 3x more than one using Start VM on Connect with an 8-hour working day pattern.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/start-virtual-machine-connect'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Cost -CheckName 'Unhealthy Hosts in Session Rotation' -Status Pass -Score 100 `
+    $m = Get-Check 'UnhealthyHostsInRotation'
+    Add-CheckResult -Category Cost -CheckName $m.Name -Status Pass -Score 100 `
         -Finding 'No unhealthy session hosts are accepting new sessions.' `
-        -Remediation '' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/drain-mode'
+        -Remediation '' -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Cost -CheckName 'Max Session Limit Configuration' -Status Warning -Score 50 `
+    $m = Get-Check 'MaxSessionLimit'
+    Add-CheckResult -Category Cost -CheckName $m.Name -Status Warning -Score 50 `
         -Finding '1 pooled host pool is at the default session limit (999999): hp-dev-pooled-01.' `
-        -Remediation 'Set a realistic max session limit based on your VM size and workload type. Recommended: D4s_v5 (4 vCPU / 16 GB) - 8-12 sessions for knowledge workers. D8s_v5 (8 vCPU / 32 GB) - 16-24 sessions for knowledge workers.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-host-pool-load-balancing'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
     Write-Section 'Reliability & Resilience'
-    Add-CheckResult -Category Reliability -CheckName 'Session Host Health' -Status Fail -Score 80 `
+    $m = Get-Check 'SessionHostHealth'
+    Add-CheckResult -Category Reliability -CheckName $m.Name -Status Fail -Score 80 `
         -Finding '8 of 10 session hosts healthy (80%). Unhealthy: 2 Unavailable.' `
-        -Remediation 'Investigate unhealthy session hosts using AVD Insights in the Azure portal. Common causes: domain trust relationship lost, FSLogix health failures, AVD agent crash, or underlying VM disk/network issues.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-session-host-in-use'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Reliability -CheckName 'RDP Shortpath / Network Auto-Detect' -Status Warning -Score 50 `
+    $m = Get-Check 'RdpShortpath'
+    Add-CheckResult -Category Reliability -CheckName $m.Name -Status Warning -Score 50 `
         -Finding '3 of 5 host pool(s) are missing explicit networkautodetect / bandwidthautodetect RDP properties.' `
-        -Remediation 'Add networkautodetect:i:1 and bandwidthautodetect:i:1 to the Custom RDP Properties of each host pool. These settings enable RDP Shortpath (UDP), which provides significantly lower latency and better session resilience than TCP Reverse Connect.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-shortpath'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Reliability -CheckName 'Agent Update Ring' -Status Pass -Score 100 `
+    $m = Get-Check 'AgentUpdateRing'
+    Add-CheckResult -Category Reliability -CheckName $m.Name -Status Pass -Score 100 `
         -Finding '1 host pool(s) in Validation ring, 4 in production ring. Good separation.' `
-        -Remediation '' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-validation-environment'
+        -Remediation '' -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Reliability -CheckName 'Session Capacity Headroom' -Status Pass -Score 100 `
+    $m = Get-Check 'SessionCapacityHeadroom'
+    Add-CheckResult -Category Reliability -CheckName $m.Name -Status Pass -Score 100 `
         -Finding 'All pooled host pools are below 85% session capacity utilisation.' `
-        -Remediation '' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+        -Remediation '' -LearnMore $m.LearnMore
 
     Write-Section 'Security Posture'
-    Add-CheckResult -Category Security -CheckName 'Drive Redirection Policy' -Status Warning -Score 40 `
+    $m = Get-Check 'DriveRedirection'
+    Add-CheckResult -Category Security -CheckName $m.Name -Status Warning -Score 40 `
         -Finding '2 host pool(s) allow broad drive redirection (drivestoredirect:s:* or unset): hp-prod-pooled-01, hp-dev-pooled-01.' `
-        -Remediation 'Review the drivestoredirect RDP property. Set drivestoredirect:s: (empty) to disable, or drivestoredirect:s:DynamicDrives for USB only. In regulated environments, explicitly disable unless a business case exists.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Security -CheckName 'Clipboard Redirection Policy' -Status Info -Score 100 `
+    $m = Get-Check 'ClipboardRedirection'
+    Add-CheckResult -Category Security -CheckName $m.Name -Status Info -Score 100 `
         -Finding '4 host pool(s) have clipboard redirection enabled (or at default). This is common but should be a deliberate decision.' `
-        -Remediation 'If clipboard access is not required for user productivity or is prohibited by your data security policy, set redirectclipboard:i:0 in host pool RDP properties.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Security -CheckName 'Trusted Launch / Secure Boot' -Status Warning -Score 60 `
+    $m = Get-Check 'TrustedLaunch'
+    Add-CheckResult -Category Security -CheckName $m.Name -Status Warning -Score 60 `
         -Finding '3 of 5 session host VMs are using Trusted Launch. 2 VMs lack Secure Boot / vTPM protection.' `
-        -Remediation 'New session host deployments should use Trusted Launch (default for Gen2 VMs). For existing Gen2 VMs, Microsoft supports migration to Trusted Launch without redeployment.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-existing-vm'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Security -CheckName 'Entra ID Join Status' -Status Info -Score 100 `
+    $m = Get-Check 'EntraIdJoin'
+    Add-CheckResult -Category Security -CheckName $m.Name -Status Info -Score 100 `
         -Finding '3 of 5 session host VM(s) appear to be hybrid-joined or domain-joined only (AADLoginForWindows extension not detected).' `
-        -Remediation 'Evaluate migrating new host pool deployments to Entra ID join. Eliminates line-of-sight dependency on domain controllers and enables Conditional Access at the session level.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/deploy-azure-ad-joined-vm'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
     Write-Section 'Operational Excellence'
-    Add-CheckResult -Category Operations -CheckName 'Diagnostic Settings' -Status Fail -Score 40 `
+    $m = Get-Check 'DiagnosticSettings'
+    Add-CheckResult -Category Operations -CheckName $m.Name -Status Fail -Score 40 `
         -Finding '2 of 5 host pool(s) have no diagnostic settings configured: hp-dev-pooled-01, hp-personal-exec, hp-prod-pooled-02.' `
-        -Remediation 'Configure diagnostic settings on each flagged host pool to send Connection, HostRegistration, Error, Management, and AgentHealthStatus logs to a Log Analytics workspace. This is a prerequisite for AVD Insights.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/diagnostics-log-analytics'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Operations -CheckName 'Resource Tagging' -Status Warning -Score 60 `
+    $m = Get-Check 'ResourceTagging'
+    Add-CheckResult -Category Operations -CheckName $m.Name -Status Warning -Score 60 `
         -Finding '2 of 5 host pool(s) are missing Environment or Owner tags: hp-dev-pooled-01, hp-test-01.' `
-        -Remediation 'Apply Environment and Owner tags to all AVD resources. Consider using Azure Policy with a DeployIfNotExists or Deny effect to enforce tagging at resource creation.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/tag-resources'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Operations -CheckName 'AVD Agent Update State' -Status Pass -Score 100 `
+    $m = Get-Check 'AgentUpdateState'
+    Add-CheckResult -Category Operations -CheckName $m.Name -Status Pass -Score 100 `
         -Finding 'All session hosts have a healthy agent update state.' `
-        -Remediation '' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-agent'
+        -Remediation '' -LearnMore $m.LearnMore
 
-    Add-CheckResult -Category Operations -CheckName 'Load Balancing Algorithm' -Status Pass -Score 100 `
+    $m = Get-Check 'LoadBalancingAlgorithm'
+    Add-CheckResult -Category Operations -CheckName $m.Name -Status Pass -Score 100 `
         -Finding '3 pool(s) use BreadthFirst (performance-optimised), 1 pool(s) use DepthFirst (cost-optimised).' `
-        -Remediation 'BreadthFirst is recommended when user experience is the top priority. DepthFirst is recommended when cost is the priority and the workload is not resource-intensive.' `
-        -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-host-pool-load-balancing'
+        -Remediation $m.Remediation -LearnMore $m.LearnMore
 }
 
 # ==============================================================================
@@ -604,11 +736,12 @@ function Invoke-CostChecks {
     Write-Section 'Cost Optimisation'
 
     # Check 1: Scaling Plan Coverage
+    $m = Get-Check 'ScalingPlanCoverage'
     if ($script:pooledHostPools.Count -eq 0) {
-        Add-CheckResult -Category Cost -CheckName 'Scaling Plan Coverage' -Status Info -Score 100 `
+        Add-CheckResult -Category Cost -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'No pooled host pools found. Scaling plans apply to pooled host pools only.' `
             -Remediation 'No action required.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+            -LearnMore $m.LearnMore
     } else {
         $referencedIds = [System.Collections.Generic.HashSet[string]]::new([System.StringComparer]::OrdinalIgnoreCase)
         foreach ($sp in $script:allScalingPlans) {
@@ -621,79 +754,72 @@ function Invoke-CostChecks {
         $covered   = @($script:pooledHostPools | Where-Object { $referencedIds.Contains($_.Id) })
         $uncovered = @($script:pooledHostPools | Where-Object { -not $referencedIds.Contains($_.Id) })
         if ($uncovered.Count -eq 0) {
-            Add-CheckResult -Category Cost -CheckName 'Scaling Plan Coverage' -Status Pass -Score 100 `
+            Add-CheckResult -Category Cost -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding ("All {0} pooled host pool(s) have a scaling plan configured." -f $script:pooledHostPools.Count) `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
             $pct = [int][math]::Round(($covered.Count / $script:pooledHostPools.Count) * 100)
             $names = ($uncovered | ForEach-Object { $_.Name }) -join ', '
-            Add-CheckResult -Category Cost -CheckName 'Scaling Plan Coverage' -Status Fail -Score $pct `
+            Add-CheckResult -Category Cost -CheckName $m.Name -Status Fail -Score $pct `
                 -Finding ("{0} of {1} pooled host pool(s) have a scaling plan. Uncovered: {2}." -f $covered.Count, $script:pooledHostPools.Count, $names) `
-                -Remediation 'Create and assign a scaling plan to each pooled host pool. Scaling plans can reduce Azure compute costs by 40-70% for environments with predictable daily usage patterns by automatically deallocating idle session hosts outside peak hours.' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 
     # Check 2: Start VM on Connect (Personal)
+    $m = Get-Check 'StartVmOnConnect'
     if ($script:personalHostPools.Count -eq 0) {
-        Add-CheckResult -Category Cost -CheckName 'Start VM on Connect (Personal Host Pools)' -Status Info -Score 100 `
+        Add-CheckResult -Category Cost -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'No personal host pools found. Start VM on Connect applies to personal host pools.' `
-            -Remediation 'No action required.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/start-virtual-machine-connect'
+            -Remediation 'No action required.' -LearnMore $m.LearnMore
     } else {
         $offPools = @($script:personalHostPools | Where-Object { -not $_.StartVMOnConnect })
         if ($offPools.Count -eq 0) {
-            Add-CheckResult -Category Cost -CheckName 'Start VM on Connect (Personal Host Pools)' -Status Pass -Score 100 `
+            Add-CheckResult -Category Cost -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding ("All {0} personal host pool(s) have Start VM on Connect enabled." -f $script:personalHostPools.Count) `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/start-virtual-machine-connect'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
             $names = ($offPools | ForEach-Object { $_.Name }) -join ', '
-            Add-CheckResult -Category Cost -CheckName 'Start VM on Connect (Personal Host Pools)' -Status Warning -Score 40 `
+            Add-CheckResult -Category Cost -CheckName $m.Name -Status Warning -Score 40 `
                 -Finding ("{0} of {1} personal host pool(s) have Start VM on Connect disabled: {2}." -f $offPools.Count, $script:personalHostPools.Count, $names) `
-                -Remediation 'Enable Start VM on Connect on all personal host pools. This ensures personal VMs are only running when users need them, rather than 24/7. Combine with an auto-shutdown schedule for maximum savings. A personal VM running 24/7 costs approximately 3x more than one using Start VM on Connect with an 8-hour working day pattern.' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/start-virtual-machine-connect'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 
     # Check 3: Unhealthy hosts still in rotation
+    $m = Get-Check 'UnhealthyHostsInRotation'
     $unhealthyStates = @('Unavailable','NeedsAssistance','UpgradeFailed','NoHeartbeat')
     $stillRotating = @($script:allSessionHosts | Where-Object {
         ($unhealthyStates -contains $_.Status) -and ($_.AllowNewSession -eq $true)
     })
     if ($stillRotating.Count -eq 0) {
-        Add-CheckResult -Category Cost -CheckName 'Unhealthy Hosts in Session Rotation' -Status Pass -Score 100 `
+        Add-CheckResult -Category Cost -CheckName $m.Name -Status Pass -Score 100 `
             -Finding 'No unhealthy session hosts are accepting new sessions.' `
-            -Remediation '' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/drain-mode'
+            -Remediation '' -LearnMore $m.LearnMore
     } else {
         $names = ($stillRotating | ForEach-Object { ($_.Name -split '/')[-1] }) -join ', '
-        Add-CheckResult -Category Cost -CheckName 'Unhealthy Hosts in Session Rotation' -Status Warning -Score 30 `
+        Add-CheckResult -Category Cost -CheckName $m.Name -Status Warning -Score 30 `
             -Finding ("{0} unhealthy host(s) still accepting new sessions: {1}." -f $stillRotating.Count, $names) `
-            -Remediation 'Set AllowNewSession = false on unhealthy hosts to drain them from the load balancer. This prevents new users from connecting to broken session hosts. Investigate the underlying health issue (check AVD agent logs at C:\Program Files\Microsoft RDAgent\) and either remediate the VM or replace the session host.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/drain-mode'
+            -Remediation $m.Remediation -LearnMore $m.LearnMore
     }
 
     # Check 4: Max Session Limit
+    $m = Get-Check 'MaxSessionLimit'
     if ($script:pooledHostPools.Count -eq 0) {
-        Add-CheckResult -Category Cost -CheckName 'Max Session Limit Configuration' -Status Info -Score 100 `
+        Add-CheckResult -Category Cost -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'No pooled host pools found. Max session limit applies to pooled host pools.' `
-            -Remediation 'No action required.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-host-pool-load-balancing'
+            -Remediation 'No action required.' -LearnMore $m.LearnMore
     } else {
         $bad = @($script:pooledHostPools | Where-Object { $_.MaxSessionLimit -ge 999999 -or $_.MaxSessionLimit -le 0 })
         if ($bad.Count -eq 0) {
-            Add-CheckResult -Category Cost -CheckName 'Max Session Limit Configuration' -Status Pass -Score 100 `
+            Add-CheckResult -Category Cost -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding ("All {0} pooled host pool(s) have a realistic max session limit." -f $script:pooledHostPools.Count) `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-host-pool-load-balancing'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
             $names = ($bad | ForEach-Object { $_.Name }) -join ', '
-            Add-CheckResult -Category Cost -CheckName 'Max Session Limit Configuration' -Status Warning -Score 50 `
+            Add-CheckResult -Category Cost -CheckName $m.Name -Status Warning -Score 50 `
                 -Finding ("{0} pooled host pool(s) at the default or invalid session limit: {1}." -f $bad.Count, $names) `
-                -Remediation 'Set a realistic max session limit based on your VM size and workload type. Recommended starting points: D4s_v5 (4 vCPU / 16 GB) - 8-12 sessions for knowledge workers, 12-16 for task workers. D8s_v5 (8 vCPU / 32 GB) - 16-24 sessions for knowledge workers. Setting an appropriate limit enables the load balancer to start new session hosts before existing ones become overloaded.' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-host-pool-load-balancing'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 }
@@ -706,75 +832,71 @@ function Invoke-ReliabilityChecks {
     Write-Section 'Reliability & Resilience'
 
     # Check 5: Session host health
+    $m = Get-Check 'SessionHostHealth'
     if ($script:allSessionHosts.Count -eq 0) {
-        Add-CheckResult -Category Reliability -CheckName 'Session Host Health' -Status Info -Score 100 `
+        Add-CheckResult -Category Reliability -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'No session hosts found across the assessed host pools.' `
             -Remediation 'Deploy session hosts into your host pool(s) to begin serving users.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-session-host-in-use'
+            -LearnMore $m.LearnMore
     } else {
         $healthyStates = @('Available','Shutdown')
         $unhealthy = @($script:allSessionHosts | Where-Object { $healthyStates -notcontains $_.Status })
         if ($unhealthy.Count -eq 0) {
-            Add-CheckResult -Category Reliability -CheckName 'Session Host Health' -Status Pass -Score 100 `
+            Add-CheckResult -Category Reliability -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding ("All {0} session host(s) are healthy." -f $script:allSessionHosts.Count) `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-session-host-in-use'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
             $healthyCount = $script:allSessionHosts.Count - $unhealthy.Count
             $pct = [int][math]::Round(($healthyCount / $script:allSessionHosts.Count) * 100)
             $breakdown = ($unhealthy | Group-Object Status | ForEach-Object { "$($_.Count) $($_.Name)" }) -join ', '
-            Add-CheckResult -Category Reliability -CheckName 'Session Host Health' -Status Fail -Score $pct `
+            Add-CheckResult -Category Reliability -CheckName $m.Name -Status Fail -Score $pct `
                 -Finding ("{0} of {1} session host(s) healthy ({2}%). Unhealthy: {3}." -f $healthyCount, $script:allSessionHosts.Count, $pct, $breakdown) `
-                -Remediation 'Investigate unhealthy session hosts using AVD Insights in the Azure portal (if diagnostic settings are configured) or by reviewing the AVD agent log directly on the affected VM at C:\Program Files\Microsoft RDAgent\. Common causes: domain trust relationship lost, FSLogix health failures, AVD agent crash, or underlying VM disk/network issues. Consider enabling AVD health alerts via Azure Monitor.' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-session-host-in-use'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 
     # Check 6: RDP Shortpath / network auto-detect
+    $m = Get-Check 'RdpShortpath'
     $missing = @($script:allHostPools | Where-Object {
         $nad = Get-RdpProperty -RdpString $_.CustomRdpProperty -PropertyName 'networkautodetect'
         $bad = Get-RdpProperty -RdpString $_.CustomRdpProperty -PropertyName 'bandwidthautodetect'
         ($nad -ne '1') -or ($bad -ne '1')
     })
     if ($missing.Count -eq 0) {
-        Add-CheckResult -Category Reliability -CheckName 'RDP Shortpath / Network Auto-Detect' -Status Pass -Score 100 `
+        Add-CheckResult -Category Reliability -CheckName $m.Name -Status Pass -Score 100 `
             -Finding ("All {0} host pool(s) have network auto-detect properties set for RDP Shortpath." -f $script:allHostPools.Count) `
-            -Remediation '' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-shortpath'
+            -Remediation '' -LearnMore $m.LearnMore
     } else {
         $names = ($missing | ForEach-Object { $_.Name }) -join ', '
-        Add-CheckResult -Category Reliability -CheckName 'RDP Shortpath / Network Auto-Detect' -Status Warning -Score 50 `
+        Add-CheckResult -Category Reliability -CheckName $m.Name -Status Warning -Score 50 `
             -Finding ("{0} of {1} host pool(s) missing explicit networkautodetect / bandwidthautodetect: {2}." -f $missing.Count, $script:allHostPools.Count, $names) `
-            -Remediation 'Add networkautodetect:i:1 and bandwidthautodetect:i:1 to the Custom RDP Properties of each host pool. These settings enable RDP Shortpath (UDP), which provides significantly lower latency, better audio/video quality, and improved session resilience compared to the TCP Reverse Connect fallback. Also ensure UDP port 3478 (STUN) is permitted outbound at the firewall for public network Shortpath.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-shortpath'
+            -Remediation $m.Remediation -LearnMore $m.LearnMore
     }
 
     # Check 7: Agent update ring
+    $m = Get-Check 'AgentUpdateRing'
     $validationCount = @($script:allHostPools | Where-Object { $_.ValidationEnvironment -eq $true }).Count
     $total = $script:allHostPools.Count
     if ($validationCount -gt 0 -and $validationCount -lt $total) {
-        Add-CheckResult -Category Reliability -CheckName 'Agent Update Ring' -Status Pass -Score 100 `
+        Add-CheckResult -Category Reliability -CheckName $m.Name -Status Pass -Score 100 `
             -Finding ("{0} host pool(s) are in the Validation ring, {1} in production ring. Good separation." -f $validationCount, ($total - $validationCount)) `
-            -Remediation '' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-validation-environment'
+            -Remediation '' -LearnMore $m.LearnMore
     } elseif ($validationCount -eq 0) {
-        Add-CheckResult -Category Reliability -CheckName 'Agent Update Ring' -Status Warning -Score 70 `
+        Add-CheckResult -Category Reliability -CheckName $m.Name -Status Warning -Score 70 `
             -Finding 'No host pools are on the validation ring. No early warning for AVD agent updates.' `
-            -Remediation 'Mark at least one non-production or low-risk host pool as a Validation environment in its properties. Validation ring pools receive AVD agent updates 1-2 weeks before the production ring, giving you an early warning of any issues before they affect all users.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-validation-environment'
+            -Remediation $m.Remediation -LearnMore $m.LearnMore
     } else {
-        Add-CheckResult -Category Reliability -CheckName 'Agent Update Ring' -Status Warning -Score 40 `
+        Add-CheckResult -Category Reliability -CheckName $m.Name -Status Warning -Score 40 `
             -Finding 'All host pools are on the Validation ring. Production users are receiving pre-release agent updates.' `
-            -Remediation 'Move your production host pools off the Validation ring. Only canary, dev, or test host pools should be in Validation. Production users should be on the standard update ring for maximum stability.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-validation-environment'
+            -Remediation $m.RemediationAllValidation -LearnMore $m.LearnMore
     }
 
     # Check 8: Session capacity headroom
+    $m = Get-Check 'SessionCapacityHeadroom'
     if ($script:pooledHostPools.Count -eq 0) {
-        Add-CheckResult -Category Reliability -CheckName 'Session Capacity Headroom' -Status Info -Score 100 `
+        Add-CheckResult -Category Reliability -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'No pooled host pools found. Capacity check applies to pooled host pools.' `
-            -Remediation 'No action required.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+            -Remediation 'No action required.' -LearnMore $m.LearnMore
     } else {
         $overCapacity = [System.Collections.Generic.List[object]]::new()
         foreach ($hp in $script:pooledHostPools) {
@@ -792,16 +914,14 @@ function Invoke-ReliabilityChecks {
             }
         }
         if ($overCapacity.Count -eq 0) {
-            Add-CheckResult -Category Reliability -CheckName 'Session Capacity Headroom' -Status Pass -Score 100 `
+            Add-CheckResult -Category Reliability -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding 'All pooled host pools are below 85% session capacity utilisation.' `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
             $detail = ($overCapacity | ForEach-Object { "$($_.Name) ($($_.Pct)%)" }) -join ', '
-            Add-CheckResult -Category Reliability -CheckName 'Session Capacity Headroom' -Status Warning -Score 30 `
+            Add-CheckResult -Category Reliability -CheckName $m.Name -Status Warning -Score 30 `
                 -Finding ("{0} pool(s) over 85% capacity: {1}." -f $overCapacity.Count, $detail) `
-                -Remediation 'Add session hosts to the over-capacity pool(s), or review whether the max session limit is set too high relative to available VM resources. Also review the scaling plan ramp-up schedule to ensure hosts are started before peak demand rather than in response to it - proactive scaling prevents the headroom problem entirely.' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/autoscale-scaling-plan'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 }
@@ -814,68 +934,66 @@ function Invoke-SecurityChecks {
     Write-Section 'Security Posture'
 
     # Check 9: Drive redirection
+    $m = Get-Check 'DriveRedirection'
     $risky = @($script:allHostPools | Where-Object {
         $v = Get-RdpProperty -RdpString $_.CustomRdpProperty -PropertyName 'drivestoredirect'
         ($null -eq $v) -or ($v -eq '*')
     })
     if ($risky.Count -eq 0) {
-        Add-CheckResult -Category Security -CheckName 'Drive Redirection Policy' -Status Pass -Score 100 `
+        Add-CheckResult -Category Security -CheckName $m.Name -Status Pass -Score 100 `
             -Finding ("All {0} host pool(s) have drive redirection explicitly restricted." -f $script:allHostPools.Count) `
-            -Remediation '' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties'
+            -Remediation '' -LearnMore $m.LearnMore
     } else {
         $names = ($risky | ForEach-Object { $_.Name }) -join ', '
-        Add-CheckResult -Category Security -CheckName 'Drive Redirection Policy' -Status Warning -Score 40 `
+        Add-CheckResult -Category Security -CheckName $m.Name -Status Warning -Score 40 `
             -Finding ("{0} host pool(s) allow broad drive redirection (drivestoredirect:s:* or unset): {1}." -f $risky.Count, $names) `
-            -Remediation 'Review the drivestoredirect RDP property on each flagged host pool. Set drivestoredirect:s: (empty value) to disable drive redirection entirely, or drivestoredirect:s:DynamicDrives to allow only removable drives (USB). In regulated environments (financial services, healthcare, government), drive redirection should be explicitly disabled unless a business case exists and it is documented.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties'
+            -Remediation $m.Remediation -LearnMore $m.LearnMore
     }
 
     # Check 10: Clipboard redirection (always Info)
+    $m = Get-Check 'ClipboardRedirection'
     $clip = @($script:allHostPools | Where-Object {
         $v = Get-RdpProperty -RdpString $_.CustomRdpProperty -PropertyName 'redirectclipboard'
         ($null -eq $v) -or ($v -eq '1')
     })
     if ($clip.Count -eq 0) {
-        Add-CheckResult -Category Security -CheckName 'Clipboard Redirection Policy' -Status Pass -Score 100 `
+        Add-CheckResult -Category Security -CheckName $m.Name -Status Pass -Score 100 `
             -Finding ("All {0} host pool(s) have clipboard redirection explicitly disabled." -f $script:allHostPools.Count) `
-            -Remediation '' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties'
+            -Remediation '' -LearnMore $m.LearnMore
     } else {
-        Add-CheckResult -Category Security -CheckName 'Clipboard Redirection Policy' -Status Info -Score 100 `
+        Add-CheckResult -Category Security -CheckName $m.Name -Status Info -Score 100 `
             -Finding ("{0} host pool(s) have clipboard redirection enabled (or at default). This is common but should be a deliberate decision." -f $clip.Count) `
-            -Remediation 'If clipboard access is not required for user productivity or is prohibited by your data security policy, set redirectclipboard:i:0 in host pool RDP properties. This is particularly important for environments handling sensitive personal or financial data where copy/paste to local devices would represent a compliance risk.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties'
+            -Remediation $m.Remediation -LearnMore $m.LearnMore
     }
 
     # Check 11: Trusted Launch
+    $m = Get-Check 'TrustedLaunch'
     if ($script:VmFetchFailed -or $script:allVMs.Count -eq 0) {
-        Add-CheckResult -Category Security -CheckName 'Trusted Launch / Secure Boot' -Status Info -Score 100 `
+        Add-CheckResult -Category Security -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'Unable to retrieve VM data - Reader permissions may be missing on the compute resources. Skipping Trusted Launch check.' `
             -Remediation 'Grant the Reader role on the VM resource groups (or subscription) so AVD-Assess can read VM properties, then re-run.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-existing-vm'
+            -LearnMore $m.LearnMore
     } else {
         $trusted = @($script:allVMs | Where-Object { $_.SecurityProfile -and $_.SecurityProfile.SecurityType -eq 'TrustedLaunch' })
         if ($trusted.Count -eq $script:allVMs.Count) {
-            Add-CheckResult -Category Security -CheckName 'Trusted Launch / Secure Boot' -Status Pass -Score 100 `
+            Add-CheckResult -Category Security -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding ("All {0} session host VM(s) are using Trusted Launch." -f $script:allVMs.Count) `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-existing-vm'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
             $pct = [int][math]::Round(($trusted.Count / $script:allVMs.Count) * 100)
-            Add-CheckResult -Category Security -CheckName 'Trusted Launch / Secure Boot' -Status Warning -Score $pct `
+            Add-CheckResult -Category Security -CheckName $m.Name -Status Warning -Score $pct `
                 -Finding ("{0} of {1} session host VM(s) using Trusted Launch ({2}%). Others lack Secure Boot / vTPM protection." -f $trusted.Count, $script:allVMs.Count, $pct) `
-                -Remediation 'New session host deployments should use Trusted Launch (enabled by default for Gen2 VMs in Azure). For existing VMs, Microsoft now supports migration to Trusted Launch for Gen2 VMs without redeployment. See the Learn More link for the migration process. Trusted Launch enables Secure Boot (prevents unsigned bootloaders and drivers) and vTPM (supports attestation and BitLocker).' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-machines/trusted-launch-existing-vm'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 
     # Check 12: Entra ID join (Info only)
+    $m = Get-Check 'EntraIdJoin'
     if ($script:VmFetchFailed -or $script:allVMs.Count -eq 0) {
-        Add-CheckResult -Category Security -CheckName 'Entra ID Join Status' -Status Info -Score 100 `
+        Add-CheckResult -Category Security -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'Unable to retrieve VM data - join status could not be evaluated.' `
             -Remediation 'Grant Reader access to the VM resource groups so AVD-Assess can inspect VM extensions.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/deploy-azure-ad-joined-vm'
+            -LearnMore $m.LearnMore
     } else {
         $entra = @($script:allVMs | Where-Object {
             $exts = @($_.Extensions)
@@ -883,15 +1001,13 @@ function Invoke-SecurityChecks {
         })
         $other = $script:allVMs.Count - $entra.Count
         if ($other -eq 0) {
-            Add-CheckResult -Category Security -CheckName 'Entra ID Join Status' -Status Pass -Score 100 `
+            Add-CheckResult -Category Security -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding ("All {0} session host VM(s) appear to be Entra ID joined." -f $script:allVMs.Count) `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/deploy-azure-ad-joined-vm'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
-            Add-CheckResult -Category Security -CheckName 'Entra ID Join Status' -Status Info -Score 100 `
+            Add-CheckResult -Category Security -CheckName $m.Name -Status Info -Score 100 `
                 -Finding ("{0} of {1} session host VM(s) appear to be hybrid-joined or domain-joined only (AADLoginForWindows extension not detected). Entra ID join is the recommended approach for new AVD deployments." -f $other, $script:allVMs.Count) `
-                -Remediation 'Evaluate migrating new host pool deployments to Entra ID join. This eliminates line-of-sight dependency on domain controllers, simplifies the identity architecture, and enables Conditional Access at the session level. Note: FSLogix profiles, MSIX App Attach, and some legacy applications may require additional planning for Entra ID join scenarios.' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/deploy-azure-ad-joined-vm'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 }
@@ -904,38 +1020,38 @@ function Invoke-OperationsChecks {
     Write-Section 'Operational Excellence'
 
     # Check 13: Diagnostic settings
+    $m = Get-Check 'DiagnosticSettings'
     if ($script:DiagFetchFailed) {
-        Add-CheckResult -Category Operations -CheckName 'Diagnostic Settings' -Status Info -Score 100 `
+        Add-CheckResult -Category Operations -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'Unable to read diagnostic settings - permissions to Microsoft.Insights may be missing.' `
             -Remediation 'Grant Monitoring Reader on the host pool resource group(s) and re-run.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/diagnostics-log-analytics'
+            -LearnMore $m.LearnMore
     } else {
         $noDiag = @($script:allHostPools | Where-Object {
             $ds = $script:diagnosticSettings[$_.Id]
             (-not $ds) -or ($ds.Count -eq 0) -or -not ($ds | Where-Object { $_.WorkspaceId })
         })
         if ($noDiag.Count -eq 0) {
-            Add-CheckResult -Category Operations -CheckName 'Diagnostic Settings' -Status Pass -Score 100 `
+            Add-CheckResult -Category Operations -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding ("All {0} host pool(s) have diagnostic settings sending logs to Log Analytics." -f $script:allHostPools.Count) `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/diagnostics-log-analytics'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
             $ok = $script:allHostPools.Count - $noDiag.Count
             $pct = [int][math]::Round(($ok / $script:allHostPools.Count) * 100)
             $names = ($noDiag | ForEach-Object { $_.Name }) -join ', '
-            Add-CheckResult -Category Operations -CheckName 'Diagnostic Settings' -Status Fail -Score $pct `
+            Add-CheckResult -Category Operations -CheckName $m.Name -Status Fail -Score $pct `
                 -Finding ("{0} of {1} host pool(s) missing diagnostic settings: {2}." -f $noDiag.Count, $script:allHostPools.Count, $names) `
-                -Remediation 'Configure diagnostic settings on each flagged host pool to send the following log categories to a Log Analytics workspace: Connection, HostRegistration, Error, Management, AgentHealthStatus. This is a prerequisite for AVD Insights and enables troubleshooting of connection failures, performance issues, and agent problems. Without diagnostic logs, you are flying blind.' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/diagnostics-log-analytics'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 
     # Check 14: Resource tagging
+    $m = Get-Check 'ResourceTagging'
     if ($script:TagFetchFailed) {
-        Add-CheckResult -Category Operations -CheckName 'Resource Tagging' -Status Info -Score 100 `
+        Add-CheckResult -Category Operations -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'Unable to read resource tags - permissions may be missing.' `
             -Remediation 'Grant Reader on the subscription or host pool resource groups and re-run.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/tag-resources'
+            -LearnMore $m.LearnMore
     } else {
         $missingTags = @($script:allHostPools | Where-Object {
             $tags = $script:hostPoolTags[$_.Id]
@@ -944,58 +1060,53 @@ function Invoke-OperationsChecks {
             -not ($hasEnv -and $hasOwner)
         })
         if ($missingTags.Count -eq 0) {
-            Add-CheckResult -Category Operations -CheckName 'Resource Tagging' -Status Pass -Score 100 `
+            Add-CheckResult -Category Operations -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding ("All {0} host pool(s) have Environment and Owner tags." -f $script:allHostPools.Count) `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/tag-resources'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
             $ok = $script:allHostPools.Count - $missingTags.Count
             $pct = [int][math]::Round(($ok / $script:allHostPools.Count) * 100)
             $names = ($missingTags | ForEach-Object { $_.Name }) -join ', '
-            Add-CheckResult -Category Operations -CheckName 'Resource Tagging' -Status Warning -Score $pct `
+            Add-CheckResult -Category Operations -CheckName $m.Name -Status Warning -Score $pct `
                 -Finding ("{0} of {1} host pool(s) missing Environment or Owner tag: {2}." -f $missingTags.Count, $script:allHostPools.Count, $names) `
-                -Remediation 'Apply the following tags to all AVD resources (host pools, session hosts, workspaces, storage accounts): Environment (e.g. Production, Development, Test) and Owner (team or person responsible). Consider using Azure Policy with a DeployIfNotExists or Deny effect to enforce tagging at resource creation. Good tagging enables cost analysis by environment in Azure Cost Management.' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/azure-resource-manager/management/tag-resources'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 
     # Check 15: Agent update state
+    $m = Get-Check 'AgentUpdateState'
     if ($script:allSessionHosts.Count -eq 0) {
-        Add-CheckResult -Category Operations -CheckName 'AVD Agent Update State' -Status Info -Score 100 `
+        Add-CheckResult -Category Operations -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'No session hosts found.' `
-            -Remediation 'No action required.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-agent'
+            -Remediation 'No action required.' -LearnMore $m.LearnMore
     } else {
         $badUpdate = @($script:allSessionHosts | Where-Object { $_.UpdateState -in @('Failed','Stalled') })
         if ($badUpdate.Count -eq 0) {
-            Add-CheckResult -Category Operations -CheckName 'AVD Agent Update State' -Status Pass -Score 100 `
+            Add-CheckResult -Category Operations -CheckName $m.Name -Status Pass -Score 100 `
                 -Finding 'All session hosts have a healthy agent update state.' `
-                -Remediation '' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-agent'
+                -Remediation '' -LearnMore $m.LearnMore
         } else {
             $ok = $script:allSessionHosts.Count - $badUpdate.Count
             $pct = [int][math]::Round(($ok / $script:allSessionHosts.Count) * 100)
             $names = ($badUpdate | ForEach-Object { ($_.Name -split '/')[-1] + " ($($_.UpdateState))" }) -join ', '
-            Add-CheckResult -Category Operations -CheckName 'AVD Agent Update State' -Status Fail -Score $pct `
+            Add-CheckResult -Category Operations -CheckName $m.Name -Status Fail -Score $pct `
                 -Finding ("{0} session host(s) have a Failed or Stalled agent update: {1}." -f $badUpdate.Count, $names) `
-                -Remediation 'Investigate agent update failures on the affected session hosts. Start by reviewing the RDAgent log at C:\Program Files\Microsoft RDAgent\AgentInstall.txt. Common causes: Windows Update failing to install prerequisites, a network proxy blocking the agent download endpoint (*.wvd.microsoft.com), antivirus blocking the installer, or the VM needing a restart. After resolving, restart the RDAgentBootLoader service to retry the update.' `
-                -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/troubleshoot-agent'
+                -Remediation $m.Remediation -LearnMore $m.LearnMore
         }
     }
 
     # Check 16: Load balancing algorithm (always Pass / informational)
+    $m = Get-Check 'LoadBalancingAlgorithm'
     if ($script:pooledHostPools.Count -eq 0) {
-        Add-CheckResult -Category Operations -CheckName 'Load Balancing Algorithm' -Status Info -Score 100 `
+        Add-CheckResult -Category Operations -CheckName $m.Name -Status Info -Score 100 `
             -Finding 'No pooled host pools found. Load balancing algorithm applies to pooled host pools only.' `
-            -Remediation 'No action required.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-host-pool-load-balancing'
+            -Remediation 'No action required.' -LearnMore $m.LearnMore
     } else {
         $bf = @($script:pooledHostPools | Where-Object { $_.LoadBalancerType -eq 'BreadthFirst' }).Count
         $df = @($script:pooledHostPools | Where-Object { $_.LoadBalancerType -eq 'DepthFirst' }).Count
-        Add-CheckResult -Category Operations -CheckName 'Load Balancing Algorithm' -Status Pass -Score 100 `
+        Add-CheckResult -Category Operations -CheckName $m.Name -Status Pass -Score 100 `
             -Finding ("Load balancing review: {0} pool(s) use BreadthFirst (performance-optimised - spreads users across more VMs), {1} pool(s) use DepthFirst (cost-optimised - fills VMs before starting new ones)." -f $bf, $df) `
-            -Remediation 'BreadthFirst is recommended when user experience is the top priority - each user gets more dedicated resources. DepthFirst is recommended when cost is the priority and the workload is not resource-intensive - it allows more VMs to be fully shut down during off-peak hours. Review your choice against your scaling plan configuration: DepthFirst works best with aggressive scale-in, BreadthFirst pairs well with reserved instances on a core set of always-on hosts.' `
-            -LearnMore 'https://learn.microsoft.com/en-us/azure/virtual-desktop/configure-host-pool-load-balancing'
+            -Remediation $m.Remediation -LearnMore $m.LearnMore
     }
 }
 
